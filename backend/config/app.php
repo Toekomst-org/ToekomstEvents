@@ -24,6 +24,14 @@ return [
     'enforce_email_confirmation_during_registration' => env('APP_ENFORCE_EMAIL_CONFIRMATION_DURING_REGISTRATION', false),
 
     /**
+     * SSO Auto-Provisioning
+     * When enabled, users logging in via SSO will be automatically created and added to an account
+     * based on their organization name from the identity provider
+     */
+    'sso_auto_provision_enabled' => env('AUTH_SSO_AUTO_PROVISION', false),
+    'sso_auto_provision_default_role' => env('AUTH_SSO_AUTO_PROVISION_ROLE', 'ORGANIZER'),
+
+    /**
      * The number of page views to batch before updating the database
      *
      * For high traffic sites, this can be set to a higher number to reduce the number of database writes

@@ -3,6 +3,7 @@
 namespace HiEvents\Http\Actions\Auth;
 
 use HiEvents\Exceptions\UnauthorizedException;
+use HiEvents\Services\Domain\Auth\DTO\SsoUserData;
 use HiEvents\Services\Domain\Auth\LoginService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
@@ -41,10 +42,20 @@ class HandleProviderCallbackAction extends BaseAuthAction
             return response()->json(['message' => 'Missing identifier from provider'], 400);
         }
 
+        // Extract SSO user data for auto-provisioning
+        $ssoUserData = new SsoUserData(
+            email: $socialUser->getEmail(),
+            firstName: $socialUser->user['given_name'] ?? $socialUser->getName() ?? '',
+            lastName: $socialUser->user['family_name'] ?? '',
+            orgName: $socialUser->user['urn:zitadel:iam:user:resourceowner:name'] ?? null,
+            orgId: $socialUser->user['urn:zitadel:iam:user:resourceowner:id'] ?? null,
+        );
+
         try {
             $loginResponse = $this->loginService->authenticateOidc(
                 email: $identifierValue,
-                requestedAccountId: null
+                requestedAccountId: null,
+                ssoUserData: $ssoUserData,
             );
         } catch (UnauthorizedException $e) {
             return response()->json(['message' => $e->getMessage()], 403);

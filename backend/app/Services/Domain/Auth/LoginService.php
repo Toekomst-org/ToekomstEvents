@@ -8,10 +8,16 @@ use HiEvents\DomainObjects\Enums\Role;
 use HiEvents\DomainObjects\Status\UserStatus;
 use HiEvents\DomainObjects\UserDomainObject;
 use HiEvents\Exceptions\UnauthorizedException;
+use HiEvents\Helper\IdHelper;
+use HiEvents\Models\Account;
+use HiEvents\Models\AccountUser;
+use HiEvents\Models\User;
 use HiEvents\Repository\Eloquent\Value\Relationship;
 use HiEvents\Repository\Interfaces\AccountUserRepositoryInterface;
 use HiEvents\Services\Domain\Auth\DTO\LoginResponse;
+use HiEvents\Services\Domain\Auth\DTO\SsoUserData;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
 use PHPOpenSourceSaver\JWTAuth\JWTAuth;
 use Psr\Log\LoggerInterface;
 
@@ -151,9 +157,17 @@ readonly class LoginService
     /**
      * @throws UnauthorizedException
      */
-    public function authenticateOidc(string $email, ?int $requestedAccountId = null): LoginResponse
-    {
-        $userModel = \HiEvents\Models\User::where('email', strtolower($email))->first();
+    public function authenticateOidc(
+        string $email,
+        ?int $requestedAccountId = null,
+        ?SsoUserData $ssoUserData = null,
+    ): LoginResponse {
+        $userModel = User::where('email', strtolower($email))->first();
+
+        // Auto-provision user if enabled and user doesn't exist
+        if (!$userModel && $ssoUserData !== null && config('app.sso_auto_provision_enabled')) {
+            $userModel = $this->autoProvisionSsoUser($ssoUserData);
+        }
 
         if (!$userModel) {
             throw new UnauthorizedException(__('User not found'));
@@ -194,7 +208,7 @@ readonly class LoginService
 
             $token = $this->jwtAuth->claims($claims)->fromUser($userModel);
 
-            \HiEvents\Models\AccountUser::where('user_id', $user->getId())
+            AccountUser::where('user_id', $user->getId())
                 ->where('account_id', $accountId)
                 ->update(['last_login_at' => now()]);
 
@@ -207,5 +221,98 @@ readonly class LoginService
             user: $user,
             accountId: $accountId,
         );
+    }
+
+    /**
+     * Auto-provision a user from SSO data
+     * Creates user and associates with account based on organization name
+     */
+    private function autoProvisionSsoUser(SsoUserData $ssoUserData): User
+    {
+        return DB::transaction(function () use ($ssoUserData) {
+            // Find or create account based on org name
+            $account = $this->findOrCreateAccountForSso($ssoUserData);
+
+            // Create the user
+            $user = User::create([
+                'email' => strtolower($ssoUserData->email),
+                'first_name' => $ssoUserData->firstName ?: 'User',
+                'last_name' => $ssoUserData->lastName ?: '',
+                'password' => bcrypt(bin2hex(random_bytes(32))), // Random password, SSO users don't use it
+                'email_verified_at' => now(),
+                'timezone' => config('app.default_timezone'),
+            ]);
+
+            // Check if this is the first user for this account (will be admin/owner)
+            $existingAccountUsers = AccountUser::where('account_id', $account->id)->count();
+            $isFirstUser = $existingAccountUsers === 0;
+
+            // Determine role
+            $role = $isFirstUser
+                ? Role::ADMIN->name
+                : (config('app.sso_auto_provision_default_role') ?: Role::ORGANIZER->name);
+
+            // Associate user with account
+            AccountUser::create([
+                'user_id' => $user->id,
+                'account_id' => $account->id,
+                'role' => $role,
+                'status' => UserStatus::ACTIVE->name,
+                'is_account_owner' => $isFirstUser,
+            ]);
+
+            $this->logger->info('SSO auto-provisioned user', [
+                'user_id' => $user->id,
+                'email' => $ssoUserData->email,
+                'account_id' => $account->id,
+                'account_name' => $account->name,
+                'org_name' => $ssoUserData->orgName,
+                'role' => $role,
+                'is_first_user' => $isFirstUser,
+            ]);
+
+            return $user;
+        });
+    }
+
+    /**
+     * Find existing account by org name, or create a new one
+     */
+    private function findOrCreateAccountForSso(SsoUserData $ssoUserData): Account
+    {
+        $orgName = $ssoUserData->orgName ?: $ssoUserData->getFullName();
+
+        // Try to find existing account by name
+        $account = Account::where('name', $orgName)->first();
+
+        if ($account) {
+            return $account;
+        }
+
+        // Create new account
+        $account = Account::create([
+            'name' => $orgName,
+            'email' => strtolower($ssoUserData->email),
+            'short_id' => IdHelper::shortId(IdHelper::ACCOUNT_PREFIX),
+            'timezone' => config('app.default_timezone'),
+            'currency_code' => config('app.default_currency_code'),
+            'account_verified_at' => config('app.saas_mode_enabled') ? null : now(),
+            'account_configuration_id' => $this->getDefaultAccountConfigurationId(),
+            'account_messaging_tier_id' => config('app.is_hi_events') ? 1 : 3,
+        ]);
+
+        $this->logger->info('SSO auto-created account', [
+            'account_id' => $account->id,
+            'account_name' => $orgName,
+            'org_name' => $ssoUserData->orgName,
+        ]);
+
+        return $account;
+    }
+
+    private function getDefaultAccountConfigurationId(): int
+    {
+        $config = \HiEvents\Models\AccountConfiguration::where('is_system_default', true)->first();
+        return $config?->id ?? 1;
     }
 }
